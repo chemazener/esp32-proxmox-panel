@@ -14,6 +14,10 @@ the host over SSH using `qm` and `pct`.
 
 ## Features
 
+- **Occupancy dashboard (default view)**: one row per *running* VM/CT with live **CPU / RAM / GPU**
+  bars. **Tap the screen** to switch to the machine selector; tap the header (or wait 30 s) to return.
+  Powered by a new `/occupancy` endpoint (CPU/RAM from `pvesh`, per-machine GPU% via
+  `nvidia-smi pmon` cross-referenced with each process's cgroup).
 - **Dynamic list** of every VM and CT with live status, continuously refreshed.
 - **Start / stop** any machine from the screen (graceful ACPI shutdown).
 - **iGPU-group switch**: a long-press on a GPU-passthrough VM shuts down the active one and boots the
@@ -28,7 +32,7 @@ the host over SSH using `qm` and `pct`.
 | Folder | What |
 |---|---|
 | `firmware/` | PlatformIO project for the ESP32 (TFT_eSPI). `secrets.example.h` → copy to `secrets.h`. |
-| `backend/`  | `vm-switcher-api`, a FastAPI service (`/machines`, `/start`, `/stop`, `/switch`, …). |
+| `backend/`  | `vm-switcher-api`, a FastAPI service (`/machines`, `/occupancy`, `/gpu`, `/start`, `/stop`, `/switch`, …). |
 | `case/`     | Two-part 3D-printable case (`base.stl` + `bezel.stl`) + parametric `e32r40t_case.scad`. |
 | `docs/`     | Architecture diagram and photos. |
 

@@ -12,14 +12,16 @@ Endpoints:
 
 Auth: X-API-Key header (env API_TOKEN).
 Config opcional via env:
-  PVE_HOST=root@YOUR_PROXMOX_HOST
+  PVE_HOST=root@192.168.1.10
   EXCLUDE_VMIDS=100              (csv)
   IGPU_GROUP=102,103,105,107     (csv: VMs que comparten iGPU UHD 630, exclusivas)
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import threading
 import time
 from typing import Optional
 
@@ -27,7 +29,7 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
-HOST = os.environ.get("PVE_HOST", "root@YOUR_PROXMOX_HOST")
+HOST = os.environ.get("PVE_HOST", "root@192.168.1.10")
 
 
 def _csv_ids(env_name: str, default: str) -> set[int]:
@@ -44,15 +46,19 @@ def _csv_ids(env_name: str, default: str) -> set[int]:
     return out
 
 
-EXCLUDE_VMIDS = _csv_ids("EXCLUDE_VMIDS", "")        # e.g. the VMID of the box running this API
-IGPU_GROUP    = _csv_ids("IGPU_GROUP",    "")        # e.g. "102,103": VMs sharing one passthrough iGPU
+EXCLUDE_VMIDS = _csv_ids("EXCLUDE_VMIDS", "100")     # CT 100 = backend host, no permitir auto-suicidio
+IGPU_GROUP    = _csv_ids("IGPU_GROUP",    "102,103,105,107")
 
-# Optional short labels shown on the panel for some VMIDs. If a machine is not
-# listed here, the firmware shows its Proxmox `name` directly. Example:
-#   LABELS = {102: "GAME", 103: "OFFICE"}
-LABELS: dict[int, str] = {}
+# Etiquetas cortas para algunos VMIDs (las que ya estaban en el firmware viejo).
+# Si una máquina no está aquí, el firmware mostrará su `name` directamente.
+LABELS = {
+    102: "GAME",
+    103: "OFFICE",
+    105: "SSD",
+    107: "OMARCHY",
+}
 
-app = FastAPI(title="VM Switcher API", version="0.2.0")
+app = FastAPI(title="VM Switcher API", version="0.3.2-host")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -64,8 +70,11 @@ def _auth(x_api_key: Optional[str]) -> None:
 
 
 def _ssh(cmd: str, timeout: int = 10) -> subprocess.CompletedProcess:
+    """Ejecuta `cmd` LOCALMENTE en el host PVE (esta API corre en el propio
+    host, no en la CT 100). Se conserva el nombre `_ssh` para no tocar el resto
+    del codigo; ya no hay salto por red — qm/pct/systemd-run son locales."""
     return subprocess.run(
-        ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", HOST, cmd],
+        ["bash", "-lc", cmd],
         capture_output=True, text=True, timeout=timeout,
     )
 
@@ -105,9 +114,42 @@ def _parse_pct_list(stdout: str) -> list[tuple[int, str, str]]:
     return out
 
 
-def _list_all() -> list[dict]:
-    """[{kind, id, name, status, label?, igpu_group}] con TODAS las CTs+VMs visibles.
-    Hace 2 llamadas SSH (qm list, pct list); coste total ~1-2 s."""
+# ---------- Listado con cache + refresco en segundo plano ----------
+# El coste real está en preguntar a Proxmox: `pvesh get /cluster/resources`
+# (~0.9 s, 1 llamada) o el fallback `qm list`+`pct list` (~2 s). Para que el
+# panel NUNCA se bloquee esperando, un hilo de fondo refresca el cache cada
+# _REFRESH_S y TODAS las peticiones (incluido el sondeo /machines) devuelven la
+# copia cacheada al instante (~2 ms).
+_LIST_TTL  = float(os.environ.get("LIST_TTL", "8"))    # antigüedad máx. del cache si el hilo de fondo muriese
+_REFRESH_S = float(os.environ.get("REFRESH_S", "2"))   # periodo del hilo de fondo
+_list_cache: dict = {"t": 0.0, "data": None}
+
+
+def _fetch_via_pvesh() -> list[dict]:
+    """1 sola llamada (~0.9 s): `pvesh get /cluster/resources --type vm` = VMs+CTs."""
+    r = _ssh("pvesh get /cluster/resources --type vm --output-format json")
+    if r.returncode != 0 or not r.stdout.strip():
+        raise RuntimeError(r.stderr.strip() or "pvesh sin salida")
+    items: list[dict] = []
+    for g in json.loads(r.stdout):
+        try:
+            vmid = int(g["vmid"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if vmid in EXCLUDE_VMIDS:
+            continue
+        kind = "VM" if g.get("type") == "qemu" else "CT"
+        items.append({
+            "kind": kind, "id": vmid, "name": g.get("name", ""),
+            "status": str(g.get("status", "")).lower(),
+            "label": LABELS.get(vmid),
+            "igpu_group": kind == "VM" and vmid in IGPU_GROUP,
+        })
+    return items
+
+
+def _fetch_via_qm_pct() -> list[dict]:
+    """Fallback (~2 s): `qm list` + `pct list` si pvesh fallara."""
     items: list[dict] = []
     rq = _ssh("qm list")
     if rq.returncode == 0:
@@ -129,8 +171,39 @@ def _list_all() -> list[dict]:
                 "label": LABELS.get(vmid),
                 "igpu_group": False,
             })
-    items.sort(key=lambda m: m["id"])
     return items
+
+
+def _list_all(force: bool = False) -> list[dict]:
+    """Listado completo de CTs+VMs. `force=False` reusa el cache si tiene
+    < _LIST_TTL s (el hilo de fondo lo mantiene fresco ~cada _REFRESH_S)."""
+    now = time.time()
+    if (not force and _list_cache["data"] is not None
+            and (now - _list_cache["t"]) < _LIST_TTL):
+        return _list_cache["data"]
+    try:
+        items = _fetch_via_pvesh()
+    except Exception:
+        items = _fetch_via_qm_pct()
+    items.sort(key=lambda m: m["id"])
+    _list_cache["data"] = items
+    _list_cache["t"] = now
+    return items
+
+
+def _refresh_loop() -> None:
+    """Hilo daemon: mantiene el cache caliente para que /machines sea instantáneo."""
+    while True:
+        try:
+            _list_all(force=True)
+        except Exception:
+            pass
+        time.sleep(_REFRESH_S)
+
+
+@app.on_event("startup")
+def _start_bg_refresh() -> None:
+    threading.Thread(target=_refresh_loop, daemon=True, name="list-refresh").start()
 
 
 def _kind_of(vmid: int, listing: Optional[list[dict]] = None) -> Optional[str]:
@@ -159,7 +232,7 @@ def get_machines(x_api_key: Optional[str] = Header(None)):
     """Lista completa para el panel ESP32 (modo nuevo).
     `active_igpu`: VMID del grupo iGPU que esté running, o null."""
     _auth(x_api_key)
-    items = _list_all()
+    items = _list_all()   # el panel sondea aquí: cache instantáneo (lo refresca el hilo de fondo)
     active_igpu: Optional[int] = None
     for m in items:
         if m["igpu_group"] and m["status"] == "running":
@@ -241,7 +314,7 @@ def switch(vmid: int, x_api_key: Optional[str] = Header(None)):
     _auth(x_api_key)
     if vmid not in IGPU_GROUP:
         raise HTTPException(400, f"vmid {vmid} not in IGPU_GROUP {sorted(IGPU_GROUP)}")
-    items = _list_all()
+    items = _list_all(force=True)
     active: Optional[int] = None
     for m in items:
         if m["igpu_group"] and m["status"] == "running":
@@ -274,3 +347,127 @@ def reset(vmid: int, x_api_key: Optional[str] = Header(None)):
     res = _run_detached("api-reset", vmid, f"qm reset {vmid}")
     res.update(kind=kind, action="reset")
     return res
+
+
+# ============================================================================
+# Ocupación de tareas (CPU/MEM/GPU por máquina) + GPU agregada.
+# Añadido 2026-07-15 para el dashboard del panel ESP32 y las gráficas del USB.
+# ============================================================================
+import re as _re
+from collections import defaultdict as _defaultdict
+
+_CG_LXC = _re.compile(r"/lxc/(\d+)")
+_CG_QEMU = _re.compile(r"/(\d+)\.scope")
+
+
+def _pid_to_vmid(pid):
+    try:
+        with open(f"/proc/{pid}/cgroup") as f:
+            cg = f.read()
+    except Exception:
+        return None
+    m = _CG_LXC.search(cg) or _CG_QEMU.search(cg)
+    return int(m.group(1)) if m else None
+
+
+def _gpu_per_vmid():
+    """{vmid: sm%} sumando sm por proceso (nvidia-smi pmon). {} si la 3080 está en VFIO."""
+    try:
+        r = subprocess.run(["nvidia-smi", "pmon", "-c", "1", "-s", "u"],
+                           capture_output=True, text=True, timeout=4)
+    except Exception:
+        return {}
+    if r.returncode != 0:
+        return {}
+    per = _defaultdict(int)
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[1])
+        except Exception:
+            continue
+        try:
+            sm = int(parts[3]) if parts[3] != "-" else 0
+        except Exception:
+            sm = 0
+        vmid = _pid_to_vmid(pid)
+        if vmid is not None:
+            per[vmid] += sm
+    return dict(per)
+
+
+_occ_cache = {"t": 0.0, "data": None}
+_OCC_TTL = 2.0
+
+
+def _fetch_occupancy():
+    try:
+        r = _ssh("pvesh get /cluster/resources --type vm --output-format json")
+        data = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else []
+    except Exception:
+        data = []
+    gpu = _gpu_per_vmid()
+    out = []
+    for g in data:
+        try:
+            vmid = int(g["vmid"])
+        except Exception:
+            continue
+        if vmid in EXCLUDE_VMIDS or str(g.get("status", "")).lower() != "running":
+            continue
+        kind = "VM" if g.get("type") == "qemu" else "CT"
+        maxmem = int(g.get("maxmem") or 1)
+        mem = int(g.get("mem") or 0)
+        out.append({
+            "id": vmid,
+            "kind": kind,
+            "label": LABELS.get(vmid) or g.get("name", ""),
+            "name": g.get("name", ""),
+            "cpu": round(float(g.get("cpu") or 0.0) * 100.0, 1),
+            "mem": min(100.0, round(mem * 100.0 / maxmem, 1)) if maxmem > 0 else 0.0,
+            "gpu": int(gpu.get(vmid, 0)),
+            "igpu_group": kind == "VM" and vmid in IGPU_GROUP,
+        })
+    # ordenar por más cargadas primero (cpu+gpu), luego por id
+    out.sort(key=lambda m: (-(m["cpu"] + m["gpu"]), m["id"]))
+    return out
+
+
+@app.get("/occupancy")
+def get_occupancy(x_api_key: Optional[str] = Header(None)):
+    """Ocupación por máquina running: cpu%, mem%, gpu%(sm). Cache 2 s."""
+    _auth(x_api_key)
+    now = time.time()
+    if _occ_cache["data"] is not None and (now - _occ_cache["t"]) < _OCC_TTL:
+        d = _occ_cache["data"]
+    else:
+        d = _fetch_occupancy()
+        _occ_cache.update(t=now, data=d)
+    return {"machines": d, "n": len(d)}
+
+
+def _gpu_totals():
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=4)
+        if r.returncode == 0 and r.stdout.strip():
+            u, used, total, temp, pw = [x.strip() for x in r.stdout.strip().splitlines()[0].split(",")]
+            return {"util": int(float(u)), "mem_used": int(float(used)), "mem_total": int(float(total)),
+                    "temp": int(float(temp)), "power": round(float(pw), 1), "vfio": False}
+    except Exception:
+        pass
+    return {"util": 0, "mem_used": 0, "mem_total": 0, "temp": 0, "power": 0.0, "vfio": True}
+
+
+@app.get("/gpu")
+def get_gpu(x_api_key: Optional[str] = Header(None)):
+    """Estado agregado de la RTX 3080 (util, VRAM, temp, potencia)."""
+    _auth(x_api_key)
+    return {"gpu": _gpu_totals()}

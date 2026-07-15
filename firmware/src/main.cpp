@@ -1,6 +1,6 @@
 // ESP32 VM Switcher v2 para el homelab de Chema.
 // Hardware: LCDWIKI E32R40T (ESP32 + 4.0" 320x480 ST7796 + XPT2046 resistive touch).
-// Backend:  http://<API_SERVER>:8088 (vm-switcher-api, see the backend/ folder), endpoint /machines.
+// Backend:  http://192.168.1.10:8088 (vm-switcher-api en el HOST Proxmox), endpoint /machines.
 //
 // Diferencias vs v1:
 //   * Lista DINÁMICA con todas las CTs+VMs visibles (excluye la del backend).
@@ -68,7 +68,26 @@ int     scrollOffset = 0;
 String  statusLine = "Iniciando...";
 bool    needsRedraw = true;
 
+// ---------- Ocupación (dashboard por defecto) ----------
+struct Occ {
+    int  id;
+    char kind[3];
+    char label[16];
+    int  cpu;   // %
+    int  mem;   // %
+    int  gpu;   // % sm
+};
+Occ occ[MAX_MACHINES];
+int nOcc = 0;
+
+// Modo de UI: 0 = dashboard de ocupación (por defecto), 1 = selector de MVs.
+int uiMode = 0;
+unsigned long lastActivityMs = 0;   // para auto-volver al dashboard tras inactividad
+
 // ---------- Forward decls ----------
+bool pollOccupancy();
+void drawDashboard();
+void drawOccRow(int y, const Occ& o);
 void connectWiFi();
 void setupOTA();
 bool pollMachines();
@@ -191,6 +210,38 @@ bool doStart(int vmid)  { return _postSimple(String("/start/")  + vmid, "ENC",  
 bool doStop(int vmid)   { return _postSimple(String("/stop/")   + vmid, "APG",    vmid); }
 bool doSwitch(int vmid) { return _postSimple(String("/switch/") + vmid, "Switch", vmid); }
 
+// ---------- Ocupación (GET /occupancy) ----------
+bool pollOccupancy() {
+    if (WiFi.status() != WL_CONNECTED) { statusLine = "WiFi caida"; return false; }
+    HTTPClient http;
+    http.setTimeout(5000);
+    http.begin(apiUrl("/occupancy"));
+    http.addHeader("X-API-Key", API_TOKEN);
+    int code = http.GET();
+    if (code != 200) { statusLine = String("API err ") + code; http.end(); return false; }
+    String body = http.getString();
+    http.end();
+
+    JsonDocument doc;
+    if (deserializeJson(doc, body)) { statusLine = "JSON err"; return false; }
+
+    int n = 0;
+    for (JsonObject m : doc["machines"].as<JsonArray>()) {
+        if (n >= MAX_MACHINES) break;
+        occ[n].id  = m["id"].as<int>();
+        const char* k  = m["kind"].as<const char*>();  if (!k) k = "?";
+        const char* lb = m["label"].as<const char*>(); if (!lb) lb = "?";
+        strlcpy(occ[n].kind,  k,  sizeof(occ[n].kind));
+        strlcpy(occ[n].label, lb, sizeof(occ[n].label));
+        occ[n].cpu = m["cpu"].as<float>();
+        occ[n].mem = m["mem"].as<float>();
+        occ[n].gpu = m["gpu"].as<int>();
+        n++;
+    }
+    nOcc = n;
+    return true;
+}
+
 // ---------- Helpers ----------
 int findIdx(int vmid) {
     for (int i = 0; i < nMachines; i++) if (machines[i].id == vmid) return i;
@@ -222,6 +273,24 @@ void handleTouch() {
     if (!tft.getTouch(&sx, &sy, 600)) return;
     if (millis() - lastTouchMs < 250) return;
     lastTouchMs = millis();
+    lastActivityMs = millis();
+
+    if (uiMode == 0) {                    // dashboard: cualquier toque abre el selector
+        uiMode = 1;
+        needsRedraw = true;
+        drawFullUI();
+        uint16_t dx, dy; while (tft.getTouch(&dx, &dy, 100)) delay(20);
+        return;
+    }
+    // uiMode == 1 (selector): tocar la CABECERA vuelve al dashboard
+    if (sy < HEADER_H) {
+        uiMode = 0;
+        needsRedraw = true;
+        pollOccupancy();
+        drawDashboard();
+        uint16_t dx, dy; while (tft.getTouch(&dx, &dy, 100)) delay(20);
+        return;
+    }
 
     // ----- Footer buttons -----
     if (sy >= FOOTER_Y && sy < FOOTER_Y + BTN_H) {
@@ -422,6 +491,84 @@ void drawFullUI() {
     needsRedraw = false;
 }
 
+// ---------- Dashboard de ocupación ----------
+static uint16_t barColor(int pct) {
+    if (pct >= 80) return COL_ERR;
+    if (pct >= 50) return COL_IGPU;
+    return COL_OK;
+}
+
+static void drawMiniBar(int x, int y, int w, const char* lbl, int pct) {
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    tft.setTextSize(1);
+    tft.setTextColor(COL_DIM, COL_ROW_BG);
+    tft.setCursor(x, y);
+    tft.print(lbl);                       // "C" / "M" / "G"
+    int bx = x + 12;
+    int bw = w - 12 - 34;
+    tft.drawRoundRect(bx, y - 1, bw, 9, 3, tft.color565(45, 55, 75));
+    int fw = (bw - 2) * pct / 100;
+    if (fw > 0) tft.fillRoundRect(bx + 1, y, fw, 7, 2, barColor(pct));
+    char v[6];
+    snprintf(v, sizeof(v), "%d%%", pct);
+    tft.setTextColor(COL_FG, COL_ROW_BG);
+    tft.setCursor(bx + bw + 4, y);
+    tft.print(v);
+}
+
+void drawOccRow(int y, const Occ& o) {
+    int x = 8, w = SCR_W - 16, h = 54;
+    tft.fillRoundRect(x, y, w, h, 8, COL_ROW_BG);
+    tft.drawRoundRect(x, y, w, h, 8, tft.color565(45, 55, 75));
+    // título: kind+id (acento) + label — tamaño 2 (más grande)
+    tft.setTextSize(2);
+    tft.setTextColor(COL_ACCENT, COL_ROW_BG);
+    tft.setCursor(x + 6, y + 4);
+    tft.printf("%s%d", o.kind, o.id);
+    tft.setTextColor(COL_FG, COL_ROW_BG);
+    tft.setCursor(x + 62, y + 4);
+    char lbl[12];
+    strncpy(lbl, o.label, sizeof(lbl) - 1);
+    lbl[sizeof(lbl) - 1] = 0;
+    tft.print(lbl);
+    // 3 barras: CPU / MEM / GPU
+    drawMiniBar(x + 6, y + 24, w - 12, "C", o.cpu);
+    drawMiniBar(x + 6, y + 34, w - 12, "M", o.mem);
+    drawMiniBar(x + 6, y + 44, w - 12, "G", o.gpu);
+}
+
+void drawDashboard() {
+    static int prevN = -1;
+    if (needsRedraw || prevN != nOcc) {
+        tft.fillScreen(COL_BG);
+        tft.setTextColor(COL_FG, COL_BG);
+        tft.setTextSize(2);
+        tft.setCursor(8, 6);
+        tft.print("Ocupacion");
+        tft.setTextSize(1);
+        tft.setCursor(8, 30);
+        if (WiFi.status() == WL_CONNECTED) {
+            tft.setTextColor(COL_DIM, COL_BG);
+            tft.printf("%s  toca->selector", WiFi.localIP().toString().c_str());
+        } else {
+            tft.setTextColor(COL_ERR, COL_BG);
+            tft.print("WiFi off");
+        }
+        tft.drawFastHLine(0, HEADER_H - 1, SCR_W, COL_DIM);
+        needsRedraw = false;
+        prevN = nOcc;
+    }
+    int y = HEADER_H + 4;
+    const int rowH = 58;
+    for (int i = 0; i < nOcc && y + rowH <= SCR_H; i++) {
+        drawOccRow(y, occ[i]);
+        y += rowH;
+    }
+    // limpiar resto si sobra espacio
+    if (y < SCR_H) tft.fillRect(0, y, SCR_W, SCR_H - y, COL_BG);
+}
+
 // ---------- Setup / loop ----------
 void setup() {
     Serial.begin(115200);
@@ -440,18 +587,38 @@ void setup() {
     setupOTA();
     pollMachines();
     if (selectedId < 0 && activeIgpu > 0) selectedId = activeIgpu;
-    drawFullUI();
+    // Arrancar en el dashboard de ocupación (modo por defecto).
+    uiMode = 0;
+    lastActivityMs = millis();
+    needsRedraw = true;
+    pollOccupancy();
+    drawDashboard();
 }
 
 unsigned long lastPoll = 0;
 void loop() {
     ArduinoOTA.handle();
     handleTouch();
-    if (millis() - lastPoll > 3000) {
-        bool ok = pollMachines();
+
+    // Auto-volver al dashboard tras 30 s sin tocar (estando en el selector).
+    if (uiMode == 1 && millis() - lastActivityMs > 30000) {
+        uiMode = 0;
+        needsRedraw = true;
+        pollOccupancy();
+        drawDashboard();
+    }
+
+    unsigned long interval = (uiMode == 0) ? 2500 : 3000;
+    if (millis() - lastPoll > interval) {
         lastPoll = millis();
-        if (needsRedraw) drawFullUI();
-        else if (!ok)     drawStatus();
+        if (uiMode == 0) {
+            pollOccupancy();
+            drawDashboard();
+        } else {
+            bool ok = pollMachines();
+            if (needsRedraw) drawFullUI();
+            else if (!ok)     drawStatus();
+        }
     }
     delay(20);
 }
