@@ -4,8 +4,11 @@ A **touch panel for a Proxmox VE host**: an ESP32 with a 4" touch screen that li
 LXC container and lets you start / stop (and iGPU-switch) them from the screen — no browser, no SSH.
 
 <p align="center">
-  <img src="docs/panel-running.jpg" alt="The panel listing Proxmox machines" width="300">
+  <img src="docs/occupancy-dashboard.jpg" alt="Occupancy dashboard: live CPU/RAM/GPU per machine" width="270">
+  &nbsp;&nbsp;
+  <img src="docs/panel-running.jpg" alt="The machine selector listing Proxmox VMs and CTs" width="270">
 </p>
+<p align="center"><sub>Default view: live per-machine <b>CPU / RAM / GPU</b> occupancy · tap to open the machine selector</sub></p>
 
 The panel is a thin WiFi client; all the Proxmox logic lives in a small FastAPI backend that talks to
 the host over SSH using `qm` and `pct`.
