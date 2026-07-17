@@ -571,10 +571,11 @@ void drawOccRow(int y, const Occ& o) {
     // 4 barras en 2x2: C/M izquierda, G/D derecha
     int halfW = (w - 12) / 2;
     int lx = x + 6, rx = x + 6 + halfW;
-    drawMiniBar(lx, y + 26, halfW, "C", o.cpu);
-    drawMiniBar(rx, y + 26, halfW, "G", o.gpu);
-    drawMiniBar(lx, y + 40, halfW, "M", o.mem);
-    drawMiniBar(rx, y + 40, halfW, "D", o.disk);
+    // mismo orden que el resumen del host (RAM, CPU, ... , DISK)
+    drawMiniBar(lx, y + 26, halfW, "M", o.mem);   // RAM
+    drawMiniBar(rx, y + 26, halfW, "C", o.cpu);   // CPU
+    drawMiniBar(lx, y + 40, halfW, "G", o.gpu);   // GPU
+    drawMiniBar(rx, y + 40, halfW, "D", o.disk);  // DISK
 }
 
 void drawDashboard() {
