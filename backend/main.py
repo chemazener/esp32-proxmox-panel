@@ -423,6 +423,8 @@ def _fetch_occupancy():
         kind = "VM" if g.get("type") == "qemu" else "CT"
         maxmem = int(g.get("maxmem") or 1)
         mem = int(g.get("mem") or 0)
+        maxdisk = int(g.get("maxdisk") or 0)
+        disk = int(g.get("disk") or 0)
         out.append({
             "id": vmid,
             "kind": kind,
@@ -431,11 +433,41 @@ def _fetch_occupancy():
             "cpu": round(float(g.get("cpu") or 0.0) * 100.0, 1),
             "mem": min(100.0, round(mem * 100.0 / maxmem, 1)) if maxmem > 0 else 0.0,
             "gpu": int(gpu.get(vmid, 0)),
+            "disk": min(100.0, round(disk * 100.0 / maxdisk, 1)) if maxdisk > 0 else 0.0,
             "igpu_group": kind == "VM" and vmid in IGPU_GROUP,
         })
     # ordenar por más cargadas primero (cpu+gpu), luego por id
     out.sort(key=lambda m: (-(m["cpu"] + m["gpu"]), m["id"]))
     return out
+
+
+def _host_stats():
+    """RAM/carga/disco/hostname del HOST PVE (vía SSH) para la barra inferior del panel."""
+    mem_total = mem_avail = disk_total = disk_used = 0
+    load1 = 0.0
+    cpus = 1
+    name = "pve"
+    try:
+        r = _ssh(
+            "awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{print t, a}' /proc/meminfo; "
+            "cut -d' ' -f1 /proc/loadavg; nproc; hostname; "
+            "zpool list -Hp -o size,alloc | awk '{s+=$1; u+=$2}END{print s, u}'",
+            timeout=8)
+        lines = r.stdout.strip().splitlines()
+        if len(lines) >= 5:
+            mem_total, mem_avail = (int(x) for x in lines[0].split())
+            load1 = float(lines[1])
+            cpus = int(lines[2])
+            name = lines[3].strip() or "pve"
+            disk_total, disk_used = (int(x) for x in lines[4].split())
+    except Exception:
+        pass
+    return {
+        "mem_avail_mb": mem_avail // 1024, "mem_total_mb": mem_total // 1024,
+        "load1": round(load1, 2), "cpus": cpus, "name": name,
+        "disk_used_gb": round(disk_used / (1024 ** 3), 1),
+        "disk_total_gb": round(disk_total / (1024 ** 3), 1),
+    }
 
 
 @app.get("/occupancy")
@@ -448,7 +480,7 @@ def get_occupancy(x_api_key: Optional[str] = Header(None)):
     else:
         d = _fetch_occupancy()
         _occ_cache.update(t=now, data=d)
-    return {"machines": d, "n": len(d)}
+    return {"machines": d, "n": len(d), "host": _host_stats()}
 
 
 def _gpu_totals():
