@@ -510,15 +510,30 @@ void drawFullUI() {
 }
 
 // ---------- Dashboard de ocupación ----------
-// Gradiente continuo verde -> amarillo -> rojo según el %.
-// Mismo criterio para todas las métricas y tanto en máquinas como en total.
-static uint16_t barColor(int pct) {
+// Color base fijo por métrica (mismo en máquinas y en total).
+// 1ª letra: C=CPU, M/R=MEM/RAM, G=GPU, D/H=DISK/HDD.
+static void metricRGB(char m, uint8_t &r, uint8_t &g, uint8_t &b) {
+    switch (m) {
+        case 'C':            r = 255; g =  80; b =  70; break;  // CPU  rojo
+        case 'M': case 'R':  r = 100; g = 180; b = 255; break;  // MEM/RAM azul (claro)
+        case 'G':            r = 200; g = 110; b = 255; break;  // GPU  morado
+        case 'D': case 'H':  r =  80; g = 220; b = 110; break;  // DISK/HDD verde
+        default:             r = g = b = 150; break;
+    }
+}
+
+// Rellena una barra con GRADIENTE horizontal (oscuro→brillante) del color de la
+// métrica; la longitud rellena = pct (más uso = se revela más gradiente).
+static void fillMetricBar(int x, int y, int w, int h, char m, int pct) {
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
-    int r, g;
-    if (pct < 50) { r = 255 * pct / 50;              g = 200; }              // verde -> amarillo
-    else          { r = 255;               g = 200 - 200 * (pct - 50) / 50; } // amarillo -> rojo
-    return tft.color565(r, g, 0);
+    uint8_t r, g, b; metricRGB(m, r, g, b);
+    int fw = w * pct / 100;
+    int den = (w > 1) ? (w - 1) : 1;
+    for (int i = 0; i < fw; i++) {
+        float k = 1.00f - 0.60f * i / den;   // claro a la izquierda -> más oscuro a la derecha
+        tft.drawFastVLine(x + i, y, h, tft.color565((uint8_t)(r * k), (uint8_t)(g * k), (uint8_t)(b * k)));
+    }
 }
 
 static void drawMiniBar(int x, int y, int w, const char* lbl, int pct) {
@@ -531,8 +546,7 @@ static void drawMiniBar(int x, int y, int w, const char* lbl, int pct) {
     int bx = x + 12;
     int bw = w - 12 - 34;
     tft.drawRoundRect(bx, y - 1, bw, 9, 3, tft.color565(45, 55, 75));
-    int fw = (bw - 2) * pct / 100;
-    if (fw > 0) tft.fillRoundRect(bx + 1, y, fw, 7, 2, barColor(pct));
+    fillMetricBar(bx + 1, y, bw - 2, 7, lbl[0], pct);
     char v[6];
     snprintf(v, sizeof(v), "%d%%", pct);
     tft.setTextColor(COL_FG, COL_ROW_BG);
@@ -608,8 +622,7 @@ void drawDashboard() {
     int ry = listBottom + 6;
     tft.setTextColor(COL_DIM, COL_ROW_BG); tft.setCursor(lblX, ry); tft.print("RAM");
     tft.drawRoundRect(barX, ry - 1, barW, 16, 3, tft.color565(45, 55, 75));
-    int rfw = (barW - 2) * memUsedPct / 100;
-    if (rfw > 0) tft.fillRoundRect(barX + 1, ry, rfw, 14, 2, barColor(memUsedPct));
+    fillMetricBar(barX + 1, ry, barW - 2, 14, 'R', memUsedPct);
     tft.setTextColor(COL_FG, COL_ROW_BG); tft.setCursor(barX + barW + 4, ry);
     // etiqueta = RAM USADA/total, para que coincida con el relleno de la barra
     tft.printf("%.0f/%.0fGB", hostMemTotalGB - hostMemAvailGB, hostMemTotalGB);
@@ -619,8 +632,7 @@ void drawDashboard() {
     int ly = listBottom + 28;
     tft.setTextColor(COL_DIM, COL_ROW_BG); tft.setCursor(lblX, ly); tft.print("CPU");
     tft.drawRoundRect(barX, ly - 1, barW, 16, 3, tft.color565(45, 55, 75));
-    int lfw = (barW - 2) * loadPct / 100;
-    if (lfw > 0) tft.fillRoundRect(barX + 1, ly, lfw, 14, 2, barColor(loadPct));
+    fillMetricBar(barX + 1, ly, barW - 2, 14, 'C', loadPct);
     tft.setTextColor(COL_FG, COL_ROW_BG); tft.setCursor(barX + barW + 4, ly);
     tft.printf("%.2f/%d", hostLoad, hostCpus);
     // Fila 3 — HDD: barra = % de disco duro USADO del host (zpool)
@@ -629,8 +641,7 @@ void drawDashboard() {
     int hy = listBottom + 50;
     tft.setTextColor(COL_DIM, COL_ROW_BG); tft.setCursor(lblX, hy); tft.print("HDD");
     tft.drawRoundRect(barX, hy - 1, barW, 16, 3, tft.color565(45, 55, 75));
-    int hfw = (barW - 2) * diskPct / 100;
-    if (hfw > 0) tft.fillRoundRect(barX + 1, hy, hfw, 14, 2, barColor(diskPct));
+    fillMetricBar(barX + 1, hy, barW - 2, 14, 'H', diskPct);
     tft.setTextColor(COL_FG, COL_ROW_BG); tft.setCursor(barX + barW + 4, hy);
     tft.printf("%.0f/%.0fGB", hostDiskUsedGB, hostDiskTotalGB);
 }
