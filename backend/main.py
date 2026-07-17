@@ -467,6 +467,7 @@ def _host_stats():
         "load1": round(load1, 2), "cpus": cpus, "name": name,
         "disk_used_gb": round(disk_used / (1024 ** 3), 1),
         "disk_total_gb": round(disk_total / (1024 ** 3), 1),
+        "gpu": _gpu_totals().get("util", 0),
     }
 
 

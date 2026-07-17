@@ -84,6 +84,7 @@ int nOcc = 0;
 // Stats del HOST Proxmox (para la barra inferior del dashboard)
 float hostMemAvailGB = 0, hostMemTotalGB = 0, hostLoad = 0;
 float hostDiskUsedGB = 0, hostDiskTotalGB = 0;   // disco duro del host (zpool)
+int   hostGpu = 0;        // % uso agregado de la GPU del host
 char hostName[24] = "";   // nombre del host PVE (llega en /occupancy)
 int   hostCpus = 1;
 
@@ -257,6 +258,7 @@ bool pollOccupancy() {
     if (hn && hn[0]) { strncpy(hostName, hn, sizeof(hostName) - 1); hostName[sizeof(hostName) - 1] = 0; }
     hostDiskUsedGB  = doc["host"]["disk_used_gb"].as<float>();
     hostDiskTotalGB = doc["host"]["disk_total_gb"].as<float>();
+    hostGpu         = doc["host"]["gpu"].as<int>();
     return true;
 }
 
@@ -516,7 +518,7 @@ static void metricRGB(char m, uint8_t &r, uint8_t &g, uint8_t &b) {
     switch (m) {
         case 'C':            r = 255; g =  80; b =  70; break;  // CPU  rojo
         case 'M': case 'R':  r = 100; g = 180; b = 255; break;  // MEM/RAM azul (claro)
-        case 'G':            r = 200; g = 110; b = 255; break;  // GPU  morado
+        case 'G':            r = 255; g = 215; b =  0; break;  // GPU  amarillo
         case 'D': case 'H':  r =  80; g = 220; b = 110; break;  // DISK/HDD verde
         default:             r = g = b = 150; break;
     }
@@ -602,7 +604,7 @@ void drawDashboard() {
     }
     int y = HEADER_H + 4;
     const int rowH = 58;
-    const int STATBAR_H = 72;
+    const int STATBAR_H = 94;
     const int listBottom = SCR_H - STATBAR_H;   // deja sitio a las 2 líneas del host
     for (int i = 0; i < nOcc && y + rowH <= listBottom; i++) {
         drawOccRow(y, occ[i]);
@@ -636,10 +638,17 @@ void drawDashboard() {
     fillMetricBar(barX + 1, ly, barW - 2, 14, 'C', loadPct);
     tft.setTextColor(COL_FG, COL_ROW_BG); tft.setCursor(barX + barW + 4, ly);
     tft.printf("%.2f/%d", hostLoad, hostCpus);
-    // Fila 3 — HDD: barra = % de disco duro USADO del host (zpool)
+    // Fila 3 — GPU: uso agregado de la GPU del host (mismo orden que las máquinas)
+    int gy = listBottom + 50;
+    tft.setTextColor(COL_DIM, COL_ROW_BG); tft.setCursor(lblX, gy); tft.print("GPU");
+    tft.drawRoundRect(barX, gy - 1, barW, 16, 3, tft.color565(45, 55, 75));
+    fillMetricBar(barX + 1, gy, barW - 2, 14, 'G', hostGpu);
+    tft.setTextColor(COL_FG, COL_ROW_BG); tft.setCursor(barX + barW + 4, gy);
+    tft.printf("%d%%", hostGpu);
+    // Fila 4 — HDD: barra = % de disco duro USADO del host (zpool)
     int diskPct = (hostDiskTotalGB > 0.1f)
         ? (int)(hostDiskUsedGB / hostDiskTotalGB * 100.0f + 0.5f) : 0;
-    int hy = listBottom + 50;
+    int hy = listBottom + 72;
     tft.setTextColor(COL_DIM, COL_ROW_BG); tft.setCursor(lblX, hy); tft.print("HDD");
     tft.drawRoundRect(barX, hy - 1, barW, 16, 3, tft.color565(45, 55, 75));
     fillMetricBar(barX + 1, hy, barW - 2, 14, 'H', diskPct);
