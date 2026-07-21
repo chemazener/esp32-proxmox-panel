@@ -1,0 +1,22 @@
+[Unit]
+Description=Turn host displays + status panels off on keyboard/mouse inactivity
+After=multi-user.target
+
+[Service]
+Type=simple
+User=root
+Environment=PYTHONUNBUFFERED=1
+# Seconds of no keyboard/mouse activity before blanking (match your monitor's DPMS timeout)
+Environment=MONITOR_IDLE_S=300
+# HID receiver to watch via usbmon even while passed through to a VM (lsusb id)
+Environment=MONITOR_HID_USB=046d:c52e
+# Optional: treat "an iGPU-passthrough VM is running" as active (default off)
+# Environment=MONITOR_IGPU_KEEP_ON=1
+# Environment=IGPU_GROUP=102,103,105,107
+ExecStartPre=-/sbin/modprobe usbmon
+ExecStart=/usr/bin/python3 /usr/local/bin/monitor-idle.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

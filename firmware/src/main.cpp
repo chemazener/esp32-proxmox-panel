@@ -87,6 +87,12 @@ float hostDiskUsedGB = 0, hostDiskTotalGB = 0;   // disco duro del host (zpool)
 int   hostGpu = 0;        // % uso agregado de la GPU del host
 char hostName[24] = "";   // nombre del host PVE (llega en /occupancy)
 int   hostCpus = 1;
+bool  hostIdle = false;   // host sin teclado/ratón (llega en /occupancy) -> apagar pantalla
+
+// Backlight / apagado por inactividad del host
+bool  blOn = true;                         // estado actual del backlight del panel
+#define BL_TOUCH_GRACE_MS 120000UL         // tras tocar, mantener 2 min aunque el host esté idle
+static void setBacklight(bool on);         // fwd decl (definida antes de setup)
 
 // Modo de UI: 0 = dashboard de ocupación (por defecto), 1 = selector de MVs.
 int uiMode = 0;
@@ -190,6 +196,11 @@ bool pollMachines() {
         machines[n].igpu_group = m["igpu_group"].as<bool>();
         n++;
     }
+    // Mantener SIEMPRE las máquinas ordenadas por número (vmid), sea cual sea
+    // el orden en que las devuelva el backend.
+    qsort(machines, n, sizeof(Machine), [](const void* a, const void* b) {
+        return ((const Machine*)a)->id - ((const Machine*)b)->id;
+    });
     bool changed = (n != nMachines) || (activeIgpu != prevActive);
     nMachines = n;
     clampScroll();
@@ -259,6 +270,7 @@ bool pollOccupancy() {
     hostDiskUsedGB  = doc["host"]["disk_used_gb"].as<float>();
     hostDiskTotalGB = doc["host"]["disk_total_gb"].as<float>();
     hostGpu         = doc["host"]["gpu"].as<int>();
+    hostIdle        = doc["host"]["idle"] | false;
     return true;
 }
 
@@ -294,6 +306,12 @@ void handleTouch() {
     if (millis() - lastTouchMs < 250) return;
     lastTouchMs = millis();
     lastActivityMs = millis();
+
+    if (!blOn) {   // pantalla apagada por idle del host: el primer toque solo la enciende
+        setBacklight(true);
+        uint16_t dx, dy; while (tft.getTouch(&dx, &dy, 100)) delay(20);
+        return;
+    }
 
     if (uiMode == 0) {                    // dashboard: cualquier toque abre el selector
         uiMode = 1;
@@ -524,16 +542,17 @@ static void metricRGB(char m, uint8_t &r, uint8_t &g, uint8_t &b) {
     }
 }
 
-// Rellena una barra con GRADIENTE horizontal (oscuro→brillante) del color de la
-// métrica; la longitud rellena = pct (más uso = se revela más gradiente).
+// Rellena una barra con GRADIENTE horizontal (oscuro→claro) del color de la
+// métrica; la longitud rellena = pct. El extremo izquierdo es el más oscuro y el
+// frente de llenado el más claro -> cuanto más llena, más clara se ve la barra.
 static void fillMetricBar(int x, int y, int w, int h, char m, int pct) {
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
     uint8_t r, g, b; metricRGB(m, r, g, b);
     int fw = w * pct / 100;
-    int den = (w > 1) ? (w - 1) : 1;
+    int den = (fw > 1) ? (fw - 1) : 1;
     for (int i = 0; i < fw; i++) {
-        float k = 1.00f - 0.60f * i / den;   // claro a la izquierda -> más oscuro a la derecha
+        float k = 0.35f + 0.65f * i / den;   // oscuro a la izquierda -> más claro en el frente
         tft.drawFastVLine(x + i, y, h, tft.color565((uint8_t)(r * k), (uint8_t)(g * k), (uint8_t)(b * k)));
     }
 }
@@ -637,7 +656,7 @@ void drawDashboard() {
     tft.drawRoundRect(barX, ly - 1, barW, 16, 3, tft.color565(45, 55, 75));
     fillMetricBar(barX + 1, ly, barW - 2, 14, 'C', loadPct);
     tft.setTextColor(COL_FG, COL_ROW_BG); tft.setCursor(barX + barW + 4, ly);
-    tft.printf("%.2f/%d", hostLoad, hostCpus);
+    tft.printf("%d%%", loadPct);
     // Fila 3 — GPU: uso agregado de la GPU del host (mismo orden que las máquinas)
     int gy = listBottom + 50;
     tft.setTextColor(COL_DIM, COL_ROW_BG); tft.setCursor(lblX, gy); tft.print("GPU");
@@ -654,6 +673,18 @@ void drawDashboard() {
     fillMetricBar(barX + 1, hy, barW - 2, 14, 'H', diskPct);
     tft.setTextColor(COL_FG, COL_ROW_BG); tft.setCursor(barX + barW + 4, hy);
     tft.printf("%.0f/%.0fGB", hostDiskUsedGB, hostDiskTotalGB);
+}
+
+// ---------- Backlight (apagado por inactividad del host) ----------
+static void setBacklight(bool on) {
+    if (on == blOn) return;
+    blOn = on;
+    digitalWrite(TFT_BL, on ? HIGH : LOW);
+    if (on) {                       // al reencender, repintar la vista actual
+        needsRedraw = true;
+        if (uiMode == 0) drawDashboard();
+        else             drawFullUI();
+    }
 }
 
 // ---------- Setup / loop ----------
@@ -687,6 +718,10 @@ void loop() {
     ArduinoOTA.handle();
     handleTouch();
 
+    // Backlight: apagar si el host lleva idle (sin teclado/ratón) y no se ha
+    // tocado el panel hace poco; el toque local lo mantiene vivo BL_TOUCH_GRACE_MS.
+    setBacklight(!hostIdle || (millis() - lastActivityMs < BL_TOUCH_GRACE_MS));
+
     // Auto-volver al dashboard tras 30 s sin tocar (estando en el selector).
     if (uiMode == 1 && millis() - lastActivityMs > 30000) {
         uiMode = 0;
@@ -700,10 +735,11 @@ void loop() {
         lastPoll = millis();
         if (uiMode == 0) {
             pollOccupancy();
-            drawDashboard();
+            if (blOn) drawDashboard();   // no repintar con la pantalla apagada
         } else {
             bool ok = pollMachines();
-            if (needsRedraw) drawFullUI();
+            if (!blOn) { /* pantalla apagada: no pintar */ }
+            else if (needsRedraw) drawFullUI();
             else if (!ok)     drawStatus();
         }
     }

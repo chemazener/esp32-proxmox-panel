@@ -447,11 +447,14 @@ def _host_stats():
     load1 = 0.0
     cpus = 1
     name = "pve"
+    idle = False
     try:
         r = _ssh(
             "awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{print t, a}' /proc/meminfo; "
             "cut -d' ' -f1 /proc/loadavg; nproc; hostname; "
-            "zpool list -Hp -o size,alloc | awk '{s+=$1; u+=$2}END{print s, u}'",
+            "zpool list -Hp -o size,alloc | awk '{s+=$1; u+=$2}END{print s, u}'; "
+            # idle: lo publica monitor-idle.service ("1" = sin teclado/ratón -> pantallas OFF)
+            "cat /run/monitor-idle.state 2>/dev/null || echo 0",
             timeout=8)
         lines = r.stdout.strip().splitlines()
         if len(lines) >= 5:
@@ -460,6 +463,8 @@ def _host_stats():
             cpus = int(lines[2])
             name = lines[3].strip() or "pve"
             disk_total, disk_used = (int(x) for x in lines[4].split())
+        if len(lines) >= 6:
+            idle = lines[5].strip() == "1"
     except Exception:
         pass
     return {
@@ -468,6 +473,7 @@ def _host_stats():
         "disk_used_gb": round(disk_used / (1024 ** 3), 1),
         "disk_total_gb": round(disk_total / (1024 ** 3), 1),
         "gpu": _gpu_totals().get("util", 0),
+        "idle": idle,
     }
 
 
